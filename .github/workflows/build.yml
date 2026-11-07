@@ -1,153 +1,64 @@
-name: Xcode - Build
+name: OpenParsec iPad fixes
 
 on:
   push:
-  pull_request:
+    branches: [ipad-client-fixes]
   workflow_dispatch:
-    inputs:
-      release__nightly:
-        description: Create a nightly release
-        type: boolean
-        required: false
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+permissions:
+  contents: read
 
 jobs:
   build:
-    name: Build using xcodebuild command
-    runs-on: macos-latest
+    runs-on: macos-15
+    timeout-minutes: 30
     env:
-      scheme: OpenParsec
-      archive_path: archive
-    outputs:
-      scheme: ${{ steps.scheme.outputs.scheme }}
-      archive_path: ${{ env.archive_path }}
-
+      DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
     steps:
-      - uses: maxim-lobanov/setup-xcode@v1
+      - uses: actions/checkout@v4
         with:
-          xcode-version: "26.2"
-      - name: Checkout
-        uses: actions/checkout@v3
+          persist-credentials: false
+      - name: Prepare patched 1.4.0 source
+        run: |
+          set -euo pipefail
+          git clone --no-checkout https://github.com/hugeBlack/OpenParsec.git source
+          git -C source checkout e516bb64b2023b1989be40626671799b15270e46
+          git -C source submodule update --init --recursive
+          git -C source apply --check "$GITHUB_WORKSPACE/ipad-client-fixes.patch"
+          git -C source apply "$GITHUB_WORKSPACE/ipad-client-fixes.patch"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString 1.4.1" source/OpenParsec/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion 1401.${{ github.run_number }}" source/OpenParsec/Info.plist
+      - name: Build iPad app
+        run: |
+          set -euo pipefail
+          xcodebuild archive -project source/OpenParsec.xcodeproj -scheme OpenParsec \
+            -archivePath "$RUNNER_TEMP/OpenParsec.xcarchive" -sdk iphoneos \
+            -destination 'generic/platform=iOS' -arch arm64 -configuration Release \
+            CODE_SIGN_IDENTITY='' CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+            2>&1 | tee "$RUNNER_TEMP/build.log" | xcbeautify
+      - name: Package for SideStore
+        run: |
+          set -euo pipefail
+          mkdir -p package/Payload
+          ditto "$RUNNER_TEMP/OpenParsec.xcarchive/Products/Applications/OpenParsec.app" package/Payload/OpenParsec.app
+          app=package/Payload/OpenParsec.app
+          find "$app/Frameworks" -type d -name '*.framework' -exec codesign --force --sign - {} \;
+          codesign --force --sign - "$app"
+          codesign --verify --deep --strict "$app"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist"
+          (cd package && zip -qr ../OpenParsec-1.4.1-ipad-fixes.ipa Payload)
+          shasum -a 256 OpenParsec-1.4.1-ipad-fixes.ipa > OpenParsec-1.4.1-ipad-fixes.sha256
+      - uses: actions/upload-artifact@v4
         with:
-          submodules: recursive
-      - name: Set Scheme
-        id: scheme
-        run: |
-          if [ $scheme = default ]
-          then
-            scheme_list=$(xcodebuild -list -json | tr -d "\n")
-            scheme=$(echo $scheme_list | ruby -e "require 'json'; puts JSON.parse(STDIN.gets)['project']['targets'][0]")
-            echo Using default scheme: $scheme
-          else
-            echo Using configured scheme: $scheme
-          fi
-          echo "scheme=$scheme" >> $GITHUB_OUTPUT
-      - name: Set filetype_parameter
-        id: filetype_parameter
-        run: |
-          filetype_parameter=`ls -A | grep -i \\.xcworkspace\$ && echo workspace || echo project`
-          echo "filetype_parameter=$filetype_parameter" >> $GITHUB_OUTPUT
-      - name: Set file_to_build
-        id: file_to_build
-        run: |
-          file_to_build=`ls -A | grep -i \\.xcworkspace\$ || ls -A | grep -i \\.xcodeproj\$`
-          file_to_build=`echo $file_to_build | awk '{$1=$1;print}'`
-          echo "file_to_build=$file_to_build" >> $GITHUB_OUTPUT
-      - name: Set Build Number
-        run: /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ github.run_number }}" OpenParsec/Info.plist
-      - name: Archive
-        env:
-          scheme: ${{ steps.scheme.outputs.scheme }}
-          filetype_parameter: ${{ steps.filetype_parameter.outputs.filetype_parameter }}
-          file_to_build: ${{ steps.file_to_build.outputs.file_to_build }}
-        run: xcodebuild archive -archivePath "$archive_path" -scheme "$scheme" -"$filetype_parameter" "$file_to_build" -sdk iphoneos -arch arm64 -configuration Release CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO | xcpretty && exit ${PIPESTATUS[0]}
-      - name: Tar Build Artifact
-        run: tar -cvf "$archive_path.xcarchive.tar" "$archive_path.xcarchive"
-      - name: Upload a Build Artifact
-        uses: actions/upload-artifact@v4
+          name: OpenParsec-iPad-fixes
+          path: |
+            OpenParsec-1.4.1-ipad-fixes.ipa
+            OpenParsec-1.4.1-ipad-fixes.sha256
+            ipad-client-fixes.patch
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: ${{ env.archive_path }}.xcarchive.tar
-          path: ${{ env.archive_path }}.xcarchive.tar
-
-  package:
-    name: Create fake-signed ipa
-    runs-on: ubuntu-latest
-    needs: [build]
-    env:
-      scheme: ${{ needs.build.outputs.scheme }}
-      archive_path: ${{ needs.build.outputs.archive_path }}
-    outputs:
-      artifact: ${{ env.scheme }}.ipa
-
-    steps:
-      - name: Download a Build Artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.archive_path }}.xcarchive.tar
-      - name: Extract Build Artifact
-        run: tar -xf "$archive_path.xcarchive.tar"
-      - name: Install ldid
-        run: |
-          if [ `uname -s` = "Linux" ]; then
-            curl -sSL -o /usr/local/bin/ldid "${{ github.server_url }}/ProcursusTeam/ldid/releases/latest/download/ldid_linux_`uname -m`"
-            chmod +x /usr/local/bin/ldid
-          elif [ `uname -s` = "Darwin" ]; then
-            brew install ldid
-          else
-            exit 1
-          fi
-      - name: Fakesign
-        run: |
-          find "$archive_path.xcarchive/Products/Applications/$scheme.app" -type d -path '*/Frameworks/*.framework' -exec ldid -S \{\} \;
-          ldid -S "$archive_path.xcarchive/Products/Applications/$scheme.app"
-      - name: Create IPA
-        run: |
-          mv "$archive_path.xcarchive/Products/Applications" Payload
-          zip -r "$scheme.ipa" "Payload" -x "._*" -x ".DS_Store" -x "__MACOSX"
-      - name: Upload a Build Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.scheme }}.ipa
-          path: ${{ env.scheme }}.ipa
-
-  release__nightly:
-    name: Nightly Release
-    permissions:
-      contents: write
-    if: inputs.release__nightly || github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-    runs-on: ubuntu-latest
-    needs: [package]
-    concurrency:
-      group: release__nightly
-      cancel-in-progress: true
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Download a Build Artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ needs.package.outputs.artifact }}
-      - name: Update AltStore source
-        id: update_source
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NIGHTLY_LINK: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
-          commit_sha: ${{ env.COMMIT_SHA }}
-          commit_msg: ${{ env.COMMIT_MSG }}
-          BUILD_NUMBER: ${{ github.run_number }}
-        run: |
-          python update_json.py
-      - name: Nightly Release
-        uses: andelf/nightly-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          body: |
-            This is a nightly release [created automatically with GitHub Actions workflow](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}).
-          files: |
-            ${{ needs.package.outputs.artifact }}
-            altstore.json
+          name: OpenParsec-build-log
+          path: ${{ runner.temp }}/build.log
+          if-no-files-found: ignore
